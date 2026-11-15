@@ -71,13 +71,13 @@ start_server() {
   echo "::error::'$*' never printed PORT:<n>"; cat "$log"; return 1
 }
 
-# The mock APIs fetch_items is tested against. The plain one rate-limits every
-# page once (429 + Retry-After) so the retry path is always exercised.
-unset TERRAFORM_API_TOKEN
-MOCK_API_FLAKY=1 start_server "$STAGE/mock.log" $PYTHON "$REPO/test/mock_api/server.py"
+# The strict HCP Terraform replay server the API tests run against. It
+# rate-limits the first request of every URL (429 + Retry-After) so the retry
+# path is always exercised, and serves 2 items per page so pagination is too.
+MOCK_FLAKY=1 MOCK_PAGE_LIMIT=2 MOCK_API_TOKEN=test-token start_server "$STAGE/mock.log" $PYTHON "$REPO/test/mock_api/server.py"
 export TERRAFORM_MOCK_API="http://127.0.0.1:$PORT"
-MOCK_API_TOKEN=test-token start_server "$STAGE/mock-auth.log" $PYTHON "$REPO/test/mock_api/server.py"
-export TERRAFORM_MOCK_API_AUTH="http://127.0.0.1:$PORT"
+# The bundled state / plan documents, read by path in test/sql/files.test.
+export TERRAFORM_FIXTURES="$REPO/internal/terraform/samples"
 
 HTTP=0
 case "$TRANSPORT" in
@@ -86,6 +86,7 @@ case "$TRANSPORT" in
   http)
     HTTP=1
     start_server "$STAGE/worker.log" "$WORKER" --http --port 0
+    WORKER_PID="${PIDS[${#PIDS[@]}-1]}"
     export TERRAFORM_WORKER="http://127.0.0.1:$PORT"
     ;;
   *) echo "::error::unknown TRANSPORT=$TRANSPORT (expected stdio|launch|http)"; exit 1 ;;
@@ -154,7 +155,7 @@ echo "executed $executed of $total test files over $TRANSPORT ($skipped skipped)
 if [ "$executed" -lt "$MIN_EXECUTED" ]; then
   echo "::error::only $executed test files ran (MIN_EXECUTED=$MIN_EXECUTED)"; rc=1
 fi
-if [ "$HTTP" = "1" ] && ! kill -0 "${PIDS[2]}" 2>/dev/null; then
+if [ "$HTTP" = "1" ] && ! kill -0 "$WORKER_PID" 2>/dev/null; then
   echo "::error::the HTTP worker died during the run:"; cat "$STAGE/worker.log"; rc=1
 fi
 exit "$rc"

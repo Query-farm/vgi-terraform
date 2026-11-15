@@ -1,0 +1,171 @@
+# name: test/sql/files.test
+# description: Offline state and plan readers (schema files), through DuckDB.
+# group: [terraform]
+
+require vgi
+
+require-env TERRAFORM_WORKER
+
+require-env TERRAFORM_FIXTURES
+
+statement ok
+LOAD json;
+
+statement ok
+ATTACH 'terraform' (TYPE vgi, LOCATION '{TERRAFORM_WORKER}');
+
+# ---------------------------------------------------------------- read_state
+
+query TI
+SELECT type, count(*) FROM terraform.files.read_state('sample:basic.tfstate') GROUP BY type ORDER BY type;
+----
+local_file	1
+null_resource	1
+random_id	1
+random_integer	2
+random_password	1
+random_pet	1
+terraform_data	1
+
+# Addresses carry the module path and the count index.
+query TTTT
+SELECT address, module_address, instance_index, mode FROM terraform.files.read_state('sample:basic.tfstate')
+WHERE type IN ('random_integer', 'random_id') ORDER BY address;
+----
+module.naming.random_id.suffix	module.naming	NULL	managed
+random_integer.port[0]	NULL	0	managed
+random_integer.port[1]	NULL	1	managed
+
+# Sensitive attributes are masked and listed; others are readable.
+query TTT
+SELECT attributes->>'result', attributes->>'bcrypt_hash', sensitive_attributes FROM terraform.files.read_state('sample:basic.tfstate')
+WHERE address = 'random_password.db';
+----
+(sensitive value)	(sensitive value)	[bcrypt_hash, result]
+
+# No sensitive value appears anywhere in the masked output.
+query I
+SELECT count(*) FROM terraform.files.read_state('sample:basic.tfstate') WHERE attributes::VARCHAR LIKE '%y4NMdpfOCW9Quij8lAgb%';
+----
+0
+
+query TT
+SELECT address, dependencies FROM terraform.files.read_state('sample:basic.tfstate') WHERE len(dependencies) > 0;
+----
+local_file.inventory	[random_pet.server]
+
+query IIT
+SELECT (attributes->>'result')::INT, schema_version, provider FROM terraform.files.read_state('sample:basic.tfstate')
+WHERE type = 'random_integer' ORDER BY instance_index;
+----
+8379	0	provider["registry.opentofu.org/hashicorp/random"]
+8312	0	provider["registry.opentofu.org/hashicorp/random"]
+
+query TITT
+SELECT DISTINCT terraform_version, serial, tainted, create_before_destroy FROM terraform.files.read_state('sample:basic.tfstate');
+----
+1.13.9	1	false	false
+
+# The same document read by path.
+query I
+SELECT count(*) FROM terraform.files.read_state('{TERRAFORM_FIXTURES}/basic.tfstate');
+----
+8
+
+# Projection of a single column.
+query T
+SELECT name FROM terraform.files.read_state('sample:basic.tfstate') WHERE type = 'random_pet';
+----
+server
+
+# ---------------------------------------------------------------- state_outputs
+
+query TTTT
+SELECT name, sensitive, value, type FROM terraform.files.state_outputs('sample:basic.tfstate') ORDER BY name;
+----
+db_password	true	NULL	"string"
+naming	false	"app-071204db"	"string"
+ports	false	[8379,8312]	["tuple",["number","number"]]
+server_name	false	"welcome-wahoo"	"string"
+
+# ---------------------------------------------------------------- read_plan
+
+query TI
+SELECT action, count(*) FROM terraform.files.read_plan('sample:change.plan.json') GROUP BY action ORDER BY action;
+----
+create	1
+delete	1
+no-op	4
+replace	2
+update	1
+
+query TTTT
+SELECT address, actions, action_reason, replace_paths FROM terraform.files.read_plan('{TERRAFORM_FIXTURES}/change.plan.json')
+WHERE action IN ('replace', 'delete') ORDER BY address;
+----
+local_file.inventory	[delete, create]	replace_because_cannot_update	[content]
+null_resource.legacy	[delete]	delete_because_no_resource_config	NULL
+random_pet.server	[delete, create]	replace_because_cannot_update	[keepers]
+
+# The in-place update: which attributes change, before and after.
+query TTT
+SELECT changed_attributes, before->'input'->>'replicas', after->'input'->>'replicas' FROM terraform.files.read_plan('sample:change.plan.json')
+WHERE action = 'update';
+----
+[input, output]	2	3
+
+# Values known only after apply are absent from after and flagged in after_unknown.
+query TT
+SELECT after->>'id', after_unknown->>'id' FROM terraform.files.read_plan('sample:change.plan.json') WHERE address = 'random_pet.server';
+----
+NULL	true
+
+# Sensitive plan values are masked on both sides.
+query TT
+SELECT before->>'result', after->>'result' FROM terraform.files.read_plan('sample:change.plan.json') WHERE type = 'random_password';
+----
+(sensitive value)	(sensitive value)
+
+query I
+SELECT count(*) FROM terraform.files.read_plan('sample:change.plan.json')
+WHERE before::VARCHAR LIKE '%y4NMdpfOCW9Quij8lAgb%' OR after::VARCHAR LIKE '%y4NMdpfOCW9Quij8lAgb%';
+----
+0
+
+query TT
+SELECT module_address, provider_name FROM terraform.files.read_plan('sample:change.plan.json') WHERE address LIKE 'module.%';
+----
+module.naming	registry.opentofu.org/hashicorp/random
+
+# ---------------------------------------------------------------- plan_outputs
+
+query TTTTTT
+SELECT name, action, sensitive, unknown, before, after FROM terraform.files.plan_outputs('sample:change.plan.json') ORDER BY name;
+----
+db_password	no-op	true	false	NULL	NULL
+naming	no-op	false	false	"app-071204db"	"app-071204db"
+ports	no-op	false	false	[8379,8312]	[8379,8312]
+server_name	update	false	true	"welcome-wahoo"	NULL
+
+# ---------------------------------------------------------------- errors
+
+statement error
+SELECT * FROM terraform.files.read_state('sample:nope.tfstate');
+----
+<REGEX>:.*no bundled sample.*
+
+statement error
+SELECT * FROM terraform.files.read_state('{TERRAFORM_FIXTURES}/does-not-exist.tfstate');
+----
+<REGEX>:.*no such file.*
+
+# A plan is not a state file, and a state is not a plan.
+statement error
+SELECT * FROM terraform.files.read_state('sample:change.plan.json');
+----
+<REGEX>:.*not a Terraform state file.*
+
+statement error
+SELECT * FROM terraform.files.read_plan('sample:basic.tfstate');
+----
+<REGEX>:.*not a JSON plan.*

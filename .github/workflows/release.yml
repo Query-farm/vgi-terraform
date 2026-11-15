@@ -1,7 +1,7 @@
 name: Release
 
 # Push a tag like v0.1.0. This gates on CI, then the shared vgi-actions workflow
-# builds the pure-Go worker (no cgo) on native runners (linux amd64/arm64, macOS arm64,
+# builds the cgo worker on native runners (linux amd64/arm64, macOS arm64,
 # Windows amd64), signs each archive with cosign, attests SLSA provenance, and
 # attaches them to the GitHub release.
 
@@ -33,5 +33,6 @@ jobs:
       bin: vgi-terraform-worker
       go_version: "1.26"
       # Set to "1" if you import vgi-go/vgi/exprduckdb (Evaluate / AutoApplyFilters).
-      cgo: "0"
+      # "1": the worker imports vgi-go/vgi/exprduckdb (exact filter fallback).
+      cgo: "1"
       version_check_cmd: ci/check-version.sh

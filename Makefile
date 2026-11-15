@@ -14,8 +14,8 @@ TOOLS           := $(CURDIR)/.tools
 HAYBARN_UNITTEST := $(TOOLS)/bin/haybarn-unittest
 GOLANGCI_LINT   := $(TOOLS)/bin/golangci-lint$(EXE)
 TRANSPORT       ?= stdio
-# Pure Go by default; set CGO_ENABLED=1 if you import vgi-go/vgi/exprduckdb.
-export CGO_ENABLED ?= 0
+# cgo is on: filters.go imports vgi-go/vgi/exprduckdb (embedded DuckDB) to re-apply pushed filters.
+export CGO_ENABLED ?= 1
 
 .DEFAULT_GOAL := help
 .PHONY: help build test test-unit test-sql test-sql-all lint lint-explain lint-ai fmt check run run-http debug tools template-diff clean

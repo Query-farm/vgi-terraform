@@ -1,300 +1,196 @@
-<!-- managed-by: vgi-starters (edit upstream in shared/README.md.tmpl, then run tools/render.py) -->
 <p align="center">
   <img src="https://query.farm/media-kit/products/vgi/vgi-logo.png" alt="Vector Gateway Interface (VGI)" width="320">
 </p>
 
-<p align="center"><em>A Query.Farm VGI worker for DuckDB, written in Go.</em></p>
+# Query HCP Terraform Runs, Workspaces, State and Plans in DuckDB
 
-# VGI Terraform Worker — Go
+> **vgi-terraform** · a [Query.Farm](https://query.farm) VGI worker
 
 [![CI](https://github.com/Query-farm/vgi-terraform/actions/workflows/ci.yml/badge.svg)](https://github.com/Query-farm/vgi-terraform/actions/workflows/ci.yml)
 [![vgi worker: query.farm](https://query.farm/media-kit/shields/vgi-worker.svg)](https://query.farm)
 
-[VGI](https://query.farm/vgi) lets DuckDB call functions that live in a separate
-process: your code, in any language, exposed as ordinary SQL. This worker adds
-three example functions that you rename and replace with your own:
+[HCP Terraform](https://developer.hashicorp.com/terraform/cloud-docs) (formerly Terraform Cloud)
+and Terraform Enterprise hold every workspace, run, plan, apply, policy result, cost estimate,
+state version and drift-detection result of your infrastructure behind a JSON:API. This worker
+turns them into SQL tables in DuckDB, so "which workspaces errored this week", "which runs
+destroy the most resources", "which teams have admin on production" or "what drifted" are a
+`GROUP BY` away.
 
-| Function | Kind | Shows you how to |
-|---|---|---|
-| `greet(name)` / `greet(name, style)` | scalar | vectorize over a column, overload, constrain a constant |
-| `sequence_table(count, step := 1)` | table | stream rows in batches, take named arguments |
-| `fetch_items(base_url, page_size := 100)` | table | page through a REST API, retry, read a secret |
+It also reads **Terraform and OpenTofu files offline**, with no credentials: `terraform.tfstate`
+files and the JSON of `terraform show -json plan.bin` become rows, including **which attribute
+forces each replacement**.
 
+- **Read-only.** The worker only sends `GET` requests.
+- **Secrets never leak.** Sensitive variables, variable-set variables and state outputs always
+  come back `NULL`; sensitive state attributes and plan values are replaced by
+  `"(sensitive value)"`; notification webhooks are reduced to their host.
+- **Pushdown.** `WHERE` filters on run status, source, workspace and creation time, and on a
+  workspace's project, name and current-run status, become HCP Terraform API filters.
+- **Unified shape.** `unified.runs` / `unified.task_runs` have the same columns as the Airflow,
+  Dagster, Prefect, Temporal, dbt, Databricks and GitHub workers, so Terraform deployments
+  `UNION ALL` with the rest of your orchestration.
 
 ## Quick start
 
-**Prerequisites:** Go 1.26+ and [uv](https://docs.astral.sh/uv/) (it runs the SQL
-test runner and the metadata checker).
-
-```bash
-make build
-```
-
-Then open DuckDB 2.0 or [Haybarn](https://query.farm/products/haybarn) and attach the
-worker. `LOCATION` is the command DuckDB runs to start it; use an absolute path,
-because a relative one resolves against DuckDB's working directory.
-
-**DuckDB 2.0:**
-
 ```sql
-SET allow_extension_repositories = 'allowed';
-CREATE EXTENSION REPOSITORY IF NOT EXISTS query_farm WITH PREFIX 'https://duckdb-extensions.query.farm';
-INSTALL vgi FROM query_farm;
-LOAD vgi FROM query_farm;
-ATTACH 'terraform' (TYPE vgi, LOCATION '/abs/path/to/vgi-terraform/bin/vgi-terraform-worker');
-```
-
-**Haybarn 2.0** (`uvx haybarn-cli`):
-
-```sql
-INSTALL vgi FROM community;
+INSTALL vgi FROM community;     -- Haybarn 2.0; on DuckDB 2.0 use the query_farm repository
 LOAD vgi;
-ATTACH 'terraform' (TYPE vgi, LOCATION '/abs/path/to/vgi-terraform/bin/vgi-terraform-worker');
+ATTACH 'terraform' (TYPE vgi, LOCATION 'github-auto://Query-farm/vgi-terraform@v0.1.0');
+
+-- No credentials needed for files: the bundled sample plan
+SELECT address, action, action_reason, replace_paths
+FROM terraform.files.read_plan('sample:change.plan.json')
+WHERE action IN ('replace', 'delete')
+ORDER BY address;
+
+-- HCP Terraform (add HOSTNAME 'tfe.example.com' for Terraform Enterprise)
+CREATE SECRET (TYPE terraform, TOKEN '...', ORGANIZATION 'acme');
+
+SELECT workspace_name, count(*) AS errored
+FROM terraform.main.runs()
+WHERE status = 'errored' AND created_at >= TIMESTAMPTZ '2026-11-01 00:00:00+00'
+GROUP BY ALL ORDER BY errored DESC;
 ```
 
-Now call the functions:
+The secret type is registered by the worker, so run `CREATE SECRET` after `ATTACH`.
 
-```sql
-SELECT terraform.main.greet('Ada');                         -- Hi, Ada!
-SELECT terraform.main.greet('Ada', 'formal');               -- Good day, Ada.
-SELECT * FROM terraform.main.sequence_table(5, step := 2) ORDER BY n;
-```
+<details><summary>Other ways to run it</summary>
 
-`fetch_items` pages through a REST API. Try it against the public demo API (25 fixed items):
+- **DuckDB 2.0**:
+  `SET allow_extension_repositories = 'allowed'; CREATE EXTENSION REPOSITORY IF NOT EXISTS query_farm WITH PREFIX 'https://duckdb-extensions.query.farm'; INSTALL vgi FROM query_farm; LOAD vgi FROM query_farm;`
+  then attach as above.
+- **Docker** (HTTP): `docker run -p 8000:8000 ghcr.io/query-farm/vgi-terraform:0.1.0`, then
+  `ATTACH 'terraform' (TYPE vgi, LOCATION 'http://localhost:8000')`.
+- **From source**: `make build` (Go 1.26+ and a C toolchain, for cgo), then
+  `ATTACH 'terraform' (TYPE vgi, LOCATION '/abs/path/to/bin/vgi-terraform-worker')`.
 
-```sql
-SELECT category, count(*) AS items, round(avg(price), 2) AS avg_price
-FROM terraform.main.fetch_items('https://vgi-starter-api.query-farm.services/v1')
-GROUP BY category ORDER BY category;
-```
-
-If an older cached extension misbehaves, refresh it with `FORCE INSTALL vgi FROM query_farm;`
-(DuckDB) or `FORCE INSTALL vgi FROM community;` (Haybarn).
-
-## Using it in a pipeline
-
-Worker functions compose with everything else in DuckDB:
-
-```sql
--- Materialize an API into a local table.
-CREATE TABLE items AS SELECT * FROM terraform.main.fetch_items('https://vgi-starter-api.query-farm.services/v1');
-
--- Join it with local files.
-SELECT i.name, i.price, s.units
-FROM items i JOIN 'sales.parquet' s ON s.item_id = i.id;
-
--- Call a scalar per row of another table.
-SELECT customer, terraform.main.greet(customer, 'formal') FROM read_csv('customers.csv');
-```
-
-## Project layout
-
-```
-cmd/vgi-terraform-worker/  # main.go: the worker binary (flags -> serve.Main)
-internal/terraform/
-  worker.go        # assembles the catalog; register new functions in NewWorker
-  meta.go          # catalog/schema metadata + helpers (objectTags, column)
-  greet.go         # scalar example (overloads, constant arg with choices)
-  sequence.go      # table function example (named args, streaming state)
-  fetch_items.go   # REST API table function (pagination, retries, secrets)
-  version.go       # the worker version (checked against release tags)
-  *_test.go        # go test unit tests
-internal/serve/    # --http / --unix / stdio and logging flags, shared with recipes
-test/sql/          # sqllogictest files run through DuckDB
-test/mock_api/     # offline mock of the REST API used by tests
-examples/          # recipes (one package main, served by bin/recipes <name>)
-ci/                # integration harness used by `make test-sql` and CI
-scripts/           # vgi_template.py (init / template-diff)
-vgi-agent-tests.yaml  # private graders for the agent test tasks
-```
-
-## Adding a function
-
-1. Create `internal/terraform/<name>.go`. Copy the closest example: `greet.go` for a
-   scalar, `sequence.go` for a generator, `fetch_items.go` for an API.
-2. Declare arguments as a struct with `vgi:"..."` tags. Use `pos=N` for positional
-   arguments and `default=V` (no `pos`) for named ones; add `ge=`, `le=`, `pattern=` or
-   `choices='a,b'` constraints. Scalar column arguments are `*array.String` (etc.) fields
-   with `const=false`. `doc=` must be the last key in the tag.
-3. Implement `Name()`, `Metadata()` (with `Description`, `Tags: withExamples(objectTags(...), examples)`
-   and `Examples`), then `OnBindTyped`/`ProcessTyped` (scalar, wrap with
-   `vgi.AsScalarFunction[Args]`) or `ArgumentSpecs`/`OnBind`/`NewState`/`Process` (table,
-   wrap with `vgi.AsTableFunction[State]`).
-4. Register it in `NewWorker` in `internal/terraform/worker.go`, and add its examples to
-   `allExamples`.
-
-**Which kind of function?**
-
-| You want to… | Use |
-|---|---|
-| compute one value per input row | a **scalar** function |
-| return a set of rows from arguments (an API, a file, a generator) | a **table** function |
-| transform or aggregate the rows of a query | a **table in-out** function or an **aggregate** |
-| expose a fixed dataset by name (`SELECT * FROM terraform.main.t`) | a **catalog table** |
-| write data out to a file or service | `COPY … TO` with a copy function |
-| accept `INSERT` / `UPDATE` / `DELETE` | a catalog table with insert/update/delete functions |
-
-The [examples/](examples/) folder has a recipe for most of these. Writable tables have no
-recipe:
-
-A writable table is a `vgi.CatalogTable` that names a table in-out function per operation in
-`InsertFunction`, `UpdateFunction` and `DeleteFunction`, with the richest result each one
-produces in `WriteResultModes`. A write function declares `vgi.WriteOptionsArgSpec()`, reads
-the requested mode with `vgi.ParseWriteOptions`, and binds and emits
-`vgi.WriteResultSchema` / `vgi.WriteResultBatch`. UPDATE and DELETE need a `vgi.RowIDField`
-column emitted by a scan that declares projection pushdown. Transactions:
-`vgi.WithSupportsTransactions` (or `AttachDecision.SupportsTransactions` per ATTACH) and
-`vgi.WithTransactionHooks`. Since VGI protocol 3.3 a table's scan and write functions are
-table-only: hidden from `duckdb_functions()` and not callable from SQL. Set `ExposeScan: true`
-on the table to keep the scan callable as an ordinary table function too (write functions never
-are). The write helpers and transaction hooks need vgi-go v0.42.0 or newer: if `go.mod` has an
-older v0.42.x, run `go get github.com/Query-farm/vgi-go@v0.42` (the newest v0.42.x; every
-v0.42.x speaks the same protocol). See
-[Writable catalog tables](https://github.com/Query-farm/vgi-go#writable-catalog-tables) and
-[`examples/writable_tx`](https://github.com/Query-farm/vgi-go/tree/main/examples/writable_tx).
+v0.1.0 is not published yet. Until it is, build from source.
+</details>
 
 ## Secrets and configuration
 
-`fetch_items` shows the recommended pattern. A bearer token comes from a DuckDB secret
-when one exists, and from an environment variable otherwise:
+```sql
+CREATE SECRET (TYPE terraform, TOKEN '<user, team or organization token>', ORGANIZATION 'acme');
+CREATE SECRET (TYPE terraform, TOKEN '...', HOSTNAME 'tfe.example.com', ORGANIZATION 'acme');
+```
+
+| field | meaning |
+|---|---|
+| `TOKEN` | API token (user, team or organization token), sent as `Authorization: Bearer`. Required. |
+| `HOSTNAME` | API host; default `app.terraform.io`. Set it for Terraform Enterprise. |
+| `ORGANIZATION` | Default organization for the `organization :=` argument and the `unified` tables. |
+| `BASE_URL` | Full base URL overriding `HOSTNAME` (e.g. a TFE on a custom port or a local mirror); `/api/v2` is appended. |
+
+The token is read on every call and never stored in scan state, logs or error messages. Only
+schema `main` and `unified` need a secret; schema `files` works without one.
+
+## What's inside
+
+### `terraform.main`: the HCP Terraform / Terraform Enterprise API
+
+| object | arguments | one row per |
+|---|---|---|
+| `organizations` (table) | | organization the token can see |
+| `projects()` | `organization :=` | project |
+| `workspaces()` | `organization :=`, `tags :=` | workspace, with current-run status |
+| `runs()` | `workspace_id :=` or `organization :=` | run, newest first, with plan resource counts |
+| `plans()` / `applies()` / `cost_estimates()` | same as `runs` | the run's plan / apply / cost estimate |
+| `policy_checks(run_id)` | | Sentinel policy check |
+| `policy_evaluations(run_id)` | | OPA / Sentinel policy evaluation, per task stage |
+| `state_versions(workspace_name)` | `organization :=` | state version (metadata only) |
+| `state_version_outputs()` | `state_version_id :=` or `workspace_id :=` | output (sensitive values `NULL`) |
+| `workspace_resources(workspace_id)` | | resource in the current state |
+| `variables(workspace_id)` | | workspace variable (sensitive values `NULL`) |
+| `variable_sets()` / `varset_variables(varset_id)` | `organization :=` | variable set / its variables |
+| `teams()` / `team_access(workspace_id)` | `organization :=` | team / team grant on a workspace |
+| `agent_pools()` / `agents(agent_pool_id)` | `organization :=` | agent pool / agent |
+| `registry_modules()` / `registry_providers()` | `organization :=` | private registry module / provider |
+| `assessments()` | `organization :=` | workspace's current drift-detection result |
+| `notification_configurations(workspace_id)` | | notification destination (host only, no secrets) |
+
+### `terraform.files`: offline readers (no credentials)
+
+| function | reads | one row per |
+|---|---|---|
+| `read_state(path)` | `terraform.tfstate` (format v4: Terraform 0.12+, OpenTofu) | resource instance: address, type, index key, provider, attributes (JSON, sensitive masked), dependencies, tainted |
+| `state_outputs(path)` | `terraform.tfstate` | root output (sensitive values `NULL`) |
+| `read_plan(path)` | `terraform show -json plan.bin` / `tofu show -json plan.bin` | resource change: action, raw actions, action reason, `replace_paths`, changed attributes, masked before/after, `after_unknown` |
+| `plan_outputs(path)` | the same plan JSON | output change |
+
+`path` is a file on the worker's filesystem, or `sample:basic.tfstate` /
+`sample:change.plan.json`, two documents bundled in the binary (generated with OpenTofu and the
+`null` / `random` / `local` providers by `scripts/gen-terraform-fixtures.sh`).
 
 ```sql
-CREATE SECRET (TYPE terraform_api, TOKEN 'your-token');      -- per session, never logged
+-- Which attribute forces each replacement?
+SELECT address, replace_paths[1] AS forced_by
+FROM terraform.files.read_plan('sample:change.plan.json')
+WHERE action = 'replace' ORDER BY address;
+
+-- An inventory of a state file
+SELECT type, count(*) FROM terraform.files.read_state('/path/to/terraform.tfstate') GROUP BY type;
 ```
 
-```bash
-TERRAFORM_API_TOKEN=your-token make run-http                # for servers and containers
-```
+### `terraform.unified`: cross-orchestrator runs
 
-Try it: the demo API's `/v1/auth` endpoint needs the published token `demo-token`.
+`unified.runs` has one row per run of the secret's organization (`pipeline` = workspace name,
+`status` normalized to queued / running / success / failed / cancelled, `raw_status` the HCP
+Terraform status, `trigger` = manual / api / event). `unified.task_runs` has the run's `plan` and
+`apply` phases (an apply that never ran is `skipped`).
 
-```sql
-SELECT count(*) FROM terraform.main.fetch_items('https://vgi-starter-api.query-farm.services/v1/auth');   -- fails: HTTP 401
-CREATE SECRET (TYPE terraform_api, TOKEN 'demo-token');
-SELECT count(*) FROM terraform.main.fetch_items('https://vgi-starter-api.query-farm.services/v1/auth');   -- 25
-```
+## Pushdown
 
-Never bake credentials into the image or the source. If a function can't run without
-real credentials, its examples can't execute in CI either. Set `execute: false` on the
-metadata check for that worker (see `.github/workflows/ci.yml`), and add
-`LINT_ARGS ?= --no-execute` to the Makefile so local runs match.
+| table | pushed to the API |
+|---|---|
+| `workspaces()` | `project_id =` → `filter[project][id]`, `name =` → `search[name]`, `current_run_status =` → `filter[current-run][status]`; `tags :=` → `search[tags]` |
+| `runs()` | `status =` / `IN` → `filter[status]`, `source =` / `IN` → `filter[source]`, `workspace_name =` / `IN` → `filter[workspace_names]`, `created_at >=` / `>` stops paging once older runs appear |
+| `plans()` / `applies()` / `cost_estimates()` | `run_created_at >=` / `>` stops paging early |
+| `unified.runs` | `status` / `raw_status` / `pipeline` (= or `IN`) → `filter[status]` / `filter[workspace_names]`; `queued_at >=` stops paging |
+| `unified.task_runs` | `run_id =` / `IN` reads just those runs |
+
+Every pushed predicate is still applied exactly by the worker, so a fuzzy API filter
+(`search[name]`) or one the API ignores never changes the result. `LIKE` and other expressions
+are evaluated in the worker. Pagination (`page[number]`, `page[size]=100`) lives in the
+resumable scan state, so long scans survive the HTTP transport; 429 and 5xx responses are
+retried, honouring `Retry-After` / `X-RateLimit-Reset` (HCP Terraform allows 30 requests per
+second, and 30 per minute on the run listings).
+
+## Known limitations
+
+- **TIMESTAMPTZ filters in a non-UTC session** (vgi-go 0.42.0): with ICU loaded and `TimeZone`
+  set to anything but UTC, a pushed `created_at >= TIMESTAMPTZ '...'` fails with "comparison
+  operands have incompatible types". Run `SET TimeZone = 'UTC'` first.
+- **Expressions over JSON and TIMESTAMPTZ columns** (`LIKE`, functions) in `WHERE` on
+  `workspaces()`, `runs()` and the unified tables are evaluated over the column's text, because
+  the SDK's embedded evaluator has neither type. Plain comparisons and `IN` are exact.
+- The API omits speculative (plan-only) runs from workspace run listings.
+- `assessments()` reads one assessment result per workspace that has one.
+- State and plan readers parse the whole document in memory (up to 1 GiB).
 
 ## Testing
 
 ```bash
-make test-unit                 # fast Go unit tests
-make test-sql                  # test/sql/*.test through DuckDB (stdio)
+make test-unit                 # Go unit tests (masking, pushdown, status mapping, client retries)
+make test-sql                  # test/sql/*.test through Haybarn (stdio)
 make test-sql TRANSPORT=http   # …over HTTP (also: launch)
 make check                     # everything CI runs
 ```
 
-`test/sql/*.test` files are [sqllogictest](https://duckdb.org/docs/stable/dev/sqllogictest/intro)
-scripts. `ci/run-integration.sh` runs them against your worker and fails on any
-unexpected skip, so a broken transport can't hide behind a green run.
-`fetch_items` is tested against `test/mock_api/server.py` so tests are fast and
-offline.
-
-**Testing against real data:** put live tests in their own `.test` file that starts with
-`require-env TERRAFORM_LIVE`. They run only when that variable is set. Add the skip reason
-to `EXPECTED_SKIP_REASONS` in CI.
-
-## Metadata and the quality score
-
-DuckDB, agents and documentation tools discover your functions through their metadata:
-titles, descriptions, argument docs, examples and keywords.
-[vgi-lint](https://github.com/Query-farm/vgi-lint-check) checks it, and CI runs it on
-every push. Its settings live in `vgi-lint.toml`, which `make lint-explain`,
-`vgi-lint lint`, and CI all read. This template scores 100/100 with no findings.
-
-```bash
-make lint-explain                              # findings, each with its fix
-make lint-explain LINT_ARGS="--format agent"   # the same, grouped for coding agents
-make lint-ai                                   # optional: an agent must solve vgi-agent-tests.yaml
-```
-
-Each report also states an **assurance level**: how much was actually verified.
-
-| Level | Reached when | Here |
-|---|---|---|
-| L1 structural | the static metadata is clean | workers that need real credentials (`execute: false` in CI) |
-| L2 behavioural | the examples also run and return what they claim | **the CI gate** |
-| L3 semantic | an agent solves the worker's own test tasks, and the docs are reviewed | `make lint-ai`, before publishing |
-
-- **How strict.** Your copy fails on warnings (`fail_on = "warning"` in `vgi-lint.toml`).
-  Raise it to `"info"` before you publish the worker for others.
-- **The linter isn't pinned.** It tracks the current quality bar, so a new rule can flag
-  metadata that passed yesterday. Fix it, or waive the finding.
-- **Waivers.** If a finding is genuinely wrong for your worker, waive it in
-  `vgi-lint.toml` with a `kind` and a `reason`.
-- **Existing workers.** If you're adding this gate to a worker that already has
-  findings, record them with `vgi-lint lint --baseline vgi-lint-baseline --update-baseline`
-  and set `baseline` in `vgi-lint.toml`. After that, only new findings fail.
-
-Metadata lives in `internal/terraform/meta.go` and each function's `Metadata()`.
-
-## Logging and debugging
-
-stdout carries the Arrow protocol, so **never print to stdout**. Log to stderr instead.
-Use `log/slog` (the SDK configures it to write to stderr); `--debug` or `--log-level debug` turns it up.
-
-- Under DuckDB (stdio/launch), worker stderr shows up in DuckDB's error messages and
-  terminal.
-- In Docker it goes to `docker logs`.
-- `make debug` runs one query against the worker with debug logging on.
-
-## Deploying
-
-The same binary serves stdio (DuckDB starts it locally) or HTTP (you host it):
-
-```bash
-docker build -t weather-worker .
-docker run -p 8000:8000 -e TERRAFORM_API_TOKEN=... weather-worker   # health: GET /health
-```
-
-```sql
-ATTACH 'terraform' (TYPE vgi, LOCATION 'https://workers.example.com/terraform');
-```
-
-Put hosted workers behind TLS and authentication. See
-[authentication](https://query.farm/vgi/authentication) for bearer tokens and JWTs, and
-[distributing a worker](https://query.farm/vgi/distributing-a-worker) for packaging.
-Pass secrets with `-e` or your platform's secret manager.
-
-## Releasing
-
-Push a tag like `v0.1.0`. The release workflow builds signed binaries for linux (amd64, arm64), macOS (arm64) and Windows (amd64) as static pure-Go binaries, and attaches them to the GitHub release. Users download the archive for their platform and point `LOCATION` at the binary inside. Go developers can also `go install github.com/Query-farm/vgi-terraform/cmd/vgi-terraform-worker@v0.1.0`. Every artifact is signed with cosign and
-carries SLSA build provenance. `ci/check-version.sh` makes sure the tag matches the
-version in `internal/terraform/version.go`.
-
-## Using with coding agents
-
-[AGENTS.md](AGENTS.md) is written for AI coding agents (Claude Code reads it via
-`CLAUDE.md`; Codex, Cursor and others read it directly). It covers the commands, the
-recipe for adding a function, the metadata checklist and the sharp edges. A good first
-prompt:
-
-> Read AGENTS.md. Replace `fetch_items` with `forecast(lat DOUBLE, lon DOUBLE)` that calls
-> the Open-Meteo API. Include full metadata, a mock-server test and a `TERRAFORM_LIVE` test.
-> You're done when `make check` passes.
-
-## Keeping up with the template
-
-`make template-diff` shows what changed upstream (CI, docs, examples) since your copy was
-made. Your copy records its template version in `.vgi-terraform.json`.
-
-## Learn more
-
-- [What is VGI?](https://query.farm/vgi) · [Getting started](https://query.farm/vgi/getting-started) · [Building a worker](https://query.farm/vgi/building-a-worker)
-- [Go SDK docs](https://query.farm/vgi/docs/go/): [scalar tutorial](https://query.farm/vgi/docs/go/tutorial/scalar/), [table tutorial](https://query.farm/vgi/docs/go/tutorial/table/)
-- [Distributing a worker](https://query.farm/vgi/distributing-a-worker) · [Choosing a language](https://query.farm/vgi/languages) · [llms.txt](https://query.farm/vgi/llms.txt)
-- SDK source: [vgi-go](https://github.com/Query-farm/vgi-go) · RPC layer: [https://vgi-rpc-go.query.farm](https://vgi-rpc-go.query.farm)
+The API tests run against `test/mock_api/server.py`, a strict replay of the documented HCP
+Terraform JSON:API shapes: it requires the bearer token, rejects unknown query parameters
+(including `filter[...]` names) and `page[size]` above 100, answers the first request of every
+URL with a 429, serves two items per page, and logs every request at `/__log` so the SQL tests
+assert which filters were pushed down. The state and plan fixtures are real OpenTofu output;
+regenerate them with `scripts/gen-terraform-fixtures.sh /path/to/tofu` (only the `null`,
+`random` and `local` providers, no cloud account).
 
 ## Support
 
 Open an issue on this repository. For VGI itself, see [query.farm](https://query.farm).
 
-## Authorship & license
+## Authorship & License
 
-The starter template is written by [Query.Farm](https://query.farm) and released under
-the [BSD Zero Clause License](LICENSE) (0BSD). Use it for anything, with no attribution
-required. Replace this section with your own license once the code is yours.
+Written by [Query.Farm](https://query.farm) and released under the
+[BSD Zero Clause License](LICENSE) (0BSD).
+
+Copyright 2026 Query Farm LLC - https://query.farm

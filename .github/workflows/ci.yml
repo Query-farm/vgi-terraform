@@ -18,8 +18,8 @@ env:
   # Pinned together: the SQL test runner and the metadata checker must speak the
   # same VGI protocol as the SDK. Template updates bump these (make template-diff).
   HAYBARN_VERSION: "2.0.0rc11"
-  # Pure Go. Importing vgi-go/vgi/exprduckdb (for Evaluate/AutoApplyFilters) needs cgo.
-  CGO_ENABLED: "0"
+  # cgo: the worker imports vgi-go/vgi/exprduckdb as the exact-filter fallback.
+  CGO_ENABLED: "1"
 
 jobs:
   quality:
@@ -45,11 +45,9 @@ jobs:
       fail-fast: false
       matrix:
         # macOS minutes cost 10x on private repos; add macos-latest here when you need it.
-        os: [ubuntu-latest, windows-latest]
+        # Linux only: the cgo build (embedded DuckDB evaluator) is not set up for Windows runners.
+        os: [ubuntu-latest]
         transport: [stdio, launch, http]
-        exclude:
-          - os: windows-latest
-            transport: launch   # the launcher uses AF_UNIX sockets
     defaults:
       run:
         shell: bash
@@ -96,8 +94,12 @@ jobs:
           location: ${{ github.workspace }}/bin/vgi-terraform-worker
           # Set in vgi-lint.toml, so local runs and CI agree.
           fail-on: ${{ steps.lintcfg.outputs.fail_on }}
-          # Set to false if your examples need real credentials or network access.
-          execute: true
+          # Credential-gated: every schema main table (workspaces, runs, plans, ...) and
+          # unified.runs / unified.task_runs need an HCP Terraform / Terraform Enterprise API
+          # and a `terraform` secret (TOKEN), so not all examples can execute here. The SQL
+          # suite runs every one against the strict replay server (test/mock_api) in the
+          # integration job, and `make lint-explain` executes the offline files examples.
+          execute: "false"
 
   docker:
     name: Docker image smoke test

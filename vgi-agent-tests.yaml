@@ -1,16 +1,100 @@
 # Private graders for the public vgi.agent_test_tasks in the worker's catalog metadata.
-# `vgi-lint lint --ai` runs an agent on each prompt and grades it with check_sql.
-# See https://github.com/Query-farm/vgi-lint-check (VGI920).
+# `vgi-lint lint --ai` runs an agent on each prompt and grades it with reference_sql.
+# See https://github.com/Query-farm/vgi-lint-check (VGI920). The files tasks read the
+# documents bundled with the worker (sample:basic.tfstate, sample:change.plan.json).
+# The HCP Terraform tasks are graded against the replay server in test/mock_api:
+#   python3 test/mock_api/server.py --port 8765 &
+#   make lint-ai LINT_ARGS="--setup-sql \"...\"" with, after ATTACH,
+#   CREATE SECRET (TYPE terraform, TOKEN 'test-token', ORGANIZATION 'acme', BASE_URL 'http://127.0.0.1:8765')
 tasks:
-  - name: formal_greeting
-    reference_sql: SELECT terraform.main.greet('Grace', 'formal') AS greeting
-  - name: sum_of_squares
-    reference_sql: SELECT sum(squared) AS total FROM terraform.main.sequence_table(10)
-  - name: stepped_sequence
-    reference_sql: SELECT n FROM terraform.main.sequence_table(4, step := 5) ORDER BY n
-  # Reads the public demo API (https://vgi-starter-api.query-farm.services/v1).
-  - name: items_per_category
-    check_sql: >-
-      SELECT count(*) = 3 AND sum(items) = 25
-      FROM (SELECT category, count(*) AS items
-            FROM terraform.main.fetch_items('https://vgi-starter-api.query-farm.services/v1') GROUP BY category)
+  - name: forced_replacements
+    reference_sql: >-
+      SELECT address, replace_paths FROM terraform.files.read_plan('sample:change.plan.json')
+      WHERE action = 'replace' ORDER BY address
+  - name: plan_action_counts
+    reference_sql: >-
+      SELECT action, count(*) AS resources FROM terraform.files.read_plan('sample:change.plan.json')
+      GROUP BY action ORDER BY action
+  - name: destroyed_resources
+    reference_sql: >-
+      SELECT address FROM terraform.files.read_plan('sample:change.plan.json') WHERE action = 'delete' ORDER BY address
+  - name: state_types
+    reference_sql: >-
+      SELECT type, count(*) AS instances FROM terraform.files.read_state('sample:basic.tfstate') GROUP BY type ORDER BY type
+  - name: sensitive_outputs
+    reference_sql: >-
+      SELECT name FROM terraform.files.state_outputs('sample:basic.tfstate') WHERE sensitive ORDER BY name
+  - name: state_dependencies
+    reference_sql: >-
+      SELECT address FROM terraform.files.read_state('sample:basic.tfstate')
+      WHERE list_contains(dependencies, 'random_pet.server') ORDER BY address
+  - name: port_values
+    reference_sql: >-
+      SELECT instance_index, (attributes->>'result')::INTEGER AS result FROM terraform.files.read_state('sample:basic.tfstate')
+      WHERE address LIKE 'random_integer.port%' ORDER BY instance_index
+  - name: unknown_outputs
+    reference_sql: >-
+      SELECT name FROM terraform.files.plan_outputs('sample:change.plan.json') WHERE unknown ORDER BY name
+  - name: errored_runs
+    reference_sql: >-
+      SELECT id, workspace_name FROM terraform.main.runs() WHERE status = 'errored' ORDER BY id
+  - name: plan_destructions
+    reference_sql: >-
+      SELECT workspace_name, sum(resource_destructions) AS destroyed FROM terraform.main.plans() GROUP BY workspace_name ORDER BY destroyed DESC LIMIT 1
+  - name: failed_applies
+    reference_sql: >-
+      SELECT run_id FROM terraform.main.applies() WHERE status = 'errored' ORDER BY run_id
+  - name: cost_increases
+    reference_sql: >-
+      SELECT run_id, delta_monthly_cost FROM terraform.main.cost_estimates() WHERE delta_monthly_cost > 0 ORDER BY run_id
+  - name: soft_failed_policy
+    reference_sql: >-
+      SELECT passed, soft_failed FROM terraform.main.policy_checks('run-net-2')
+  - name: opa_mandatory
+    reference_sql: >-
+      SELECT stage, mandatory_failed FROM terraform.main.policy_evaluations('run-app-2') WHERE policy_kind = 'opa' AND mandatory_failed > 0
+  - name: state_history
+    reference_sql: >-
+      SELECT count(*) AS versions, max(serial) AS latest_serial FROM terraform.main.state_versions('prod-network')
+  - name: vpc_output
+    reference_sql: >-
+      SELECT value->>'$' AS vpc_id FROM terraform.main.state_version_outputs(workspace_id := 'ws-net') WHERE name = 'vpc_id'
+  - name: resource_types
+    reference_sql: >-
+      SELECT provider_type, count(*) AS resources FROM terraform.main.workspace_resources('ws-net') GROUP BY provider_type ORDER BY provider_type
+  - name: sensitive_variables
+    reference_sql: >-
+      SELECT key FROM terraform.main.variables('ws-net') WHERE sensitive ORDER BY key
+  - name: global_varset_keys
+    reference_sql: >-
+      SELECT v.key FROM terraform.main.variable_sets() s, terraform.main.varset_variables('varset-aws') v WHERE s.global AND s.id = 'varset-aws' ORDER BY v.key
+  - name: workspace_admins
+    reference_sql: >-
+      SELECT t.name FROM terraform.main.team_access('ws-net') a JOIN terraform.main.teams() t ON t.id = a.team_id WHERE a.access = 'admin' ORDER BY t.name
+  - name: unhealthy_agents
+    reference_sql: >-
+      SELECT p.name AS pool, a.name AS agent FROM terraform.main.agent_pools() p, terraform.main.agents('apool-dc1') a WHERE p.id = 'apool-dc1' AND a.status NOT IN ('idle', 'busy') ORDER BY a.name
+  - name: module_versions
+    reference_sql: >-
+      SELECT name, len(versions) AS versions FROM terraform.main.registry_modules() ORDER BY name
+  - name: private_providers
+    reference_sql: >-
+      SELECT namespace, name FROM terraform.main.registry_providers() ORDER BY name
+  - name: drifted_workspaces
+    reference_sql: >-
+      SELECT workspace_name FROM terraform.main.assessments() WHERE drifted ORDER BY workspace_name
+  - name: drift_notifications
+    reference_sql: >-
+      SELECT name FROM terraform.main.notification_configurations('ws-net') WHERE list_contains(triggers, 'assessment:drifted') ORDER BY name
+  - name: project_workspaces
+    reference_sql: >-
+      SELECT p.name, count(w.id) AS workspaces FROM terraform.main.projects() p LEFT JOIN terraform.main.workspaces() w ON w.project_id = p.id GROUP BY p.name ORDER BY p.name
+  - name: assessment_orgs
+    reference_sql: >-
+      SELECT name FROM terraform.main.organizations WHERE assessments_enforced ORDER BY name
+  - name: unified_outcomes
+    reference_sql: >-
+      SELECT status, count(*) AS runs FROM terraform.unified.runs GROUP BY status ORDER BY status
+  - name: skipped_phases
+    reference_sql: >-
+      SELECT run_id FROM terraform.unified.task_runs WHERE task_name = 'apply' AND status = 'skipped' ORDER BY run_id

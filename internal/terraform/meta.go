@@ -1,163 +1,36 @@
-// Discovery metadata: the one file to edit when you rename or extend the worker.
-//
-// DuckDB, coding agents and the vgi-lint metadata checker all read these tags.
-// Keep every object documented and `make lint-explain` stays at 100.
-//
-//   - Catalog-level tags (title, license, author, links, long description)
-//     live in CatalogTags below.
-//   - Every function carries objectTags(...): a title, a category from
-//     SchemaCategories, search keywords, and LLM- and human-facing docs.
+// Catalog and schema descriptions, agent test tasks and catalog-level tags.
 
 package terraform
 
-import (
-	"encoding/json"
-	"fmt"
-	"strings"
+// CatalogComment is the catalog's one-line description in directories.
+const CatalogComment = "HCP Terraform and Terraform Enterprise workspaces, runs, plans, policy results, state and " +
+	"drift as SQL, plus offline readers for terraform.tfstate files and plan JSON. Read-only."
 
-	"github.com/Query-farm/vgi-go/vgi"
-	"github.com/apache/arrow-go/v18/arrow"
-)
+const catalogDocLLM = "Read-only SQL over HCP Terraform / Terraform Enterprise (API v2) and over Terraform / " +
+	"OpenTofu files. Schema main reads the API with a DuckDB secret of type terraform (TOKEN, optional HOSTNAME " +
+	"for Terraform Enterprise, ORGANIZATION as the default organization): organizations, projects, workspaces, " +
+	"runs and their plans, applies, cost estimates, Sentinel policy checks and OPA/Sentinel policy evaluations, " +
+	"state versions and outputs, workspace resources, variables and variable sets (sensitive values are always " +
+	"NULL), teams and team access, agent pools and agents, private registry modules and providers, health " +
+	"assessments (drift detection) and notification configurations. Hierarchy: organization -> project -> " +
+	"workspace (ws-...) -> run (run-...) -> plan / apply; functions that need a parent take its id as an " +
+	"argument. Schema files needs no credentials: read_state(path) and state_outputs(path) read a " +
+	"terraform.tfstate (v4) file, read_plan(path) and plan_outputs(path) read `terraform show -json` plan " +
+	"output; sensitive values are masked; sample:basic.tfstate and sample:change.plan.json are bundled. Schema " +
+	"unified exposes runs and their plan/apply phases in the column layout shared by the Query.Farm orchestrator " +
+	"workers for UNION ALL."
 
-// CatalogName is the name DuckDB attaches the worker under.
-const CatalogName = "terraform"
-
-// SourceURL is where this worker's code lives.
-const SourceURL = "https://github.com/Query-farm/vgi-terraform"
-
-// category is one entry of the schema's vgi.categories list.
-type category struct {
-	Name        string `json:"name"`
-	Title       string `json:"title"`
-	Description string `json:"description"`
-}
-
-// SchemaCategories group functions in docs and agent tools. Every function's
-// vgi.category must name one of these.
-var SchemaCategories = []category{
-	{Name: "text", Title: "Text", Description: "Functions that build or transform strings."},
-	{Name: "generators", Title: "Generators", Description: "Table functions that generate rows."},
-	{Name: "api", Title: "REST APIs", Description: "Table functions that read from HTTP APIs."},
-}
-
-// mustJSON marshals v, panicking on failure (only static data is passed).
-func mustJSON(v any) string {
-	b, err := json.Marshal(v)
-	if err != nil {
-		panic(err)
-	}
-	return string(b)
-}
-
-// keywordsArray turns "a, b, c" into the JSON array string vgi.keywords requires.
-func keywordsArray(keywords string) string {
-	out := []string{}
-	for _, k := range strings.Split(keywords, ",") {
-		if k = strings.TrimSpace(k); k != "" {
-			out = append(out, k)
-		}
-	}
-	return mustJSON(out)
-}
-
-// docs is the set of standard per-object discovery fields.
-type docs struct {
-	Title    string
-	Category string
-	Keywords string
-	DocLLM   string
-	DocMD    string
-}
-
-// objectTags builds the standard per-object discovery tags.
-func objectTags(d docs) map[string]string {
-	known := false
-	for _, c := range SchemaCategories {
-		known = known || c.Name == d.Category
-	}
-	if !known {
-		panic(fmt.Sprintf("unknown category %q; add it to SchemaCategories", d.Category))
-	}
-	return map[string]string{
-		"vgi.title":    d.Title,
-		"vgi.category": d.Category,
-		"vgi.keywords": keywordsArray(d.Keywords),
-		"vgi.doc_llm":  d.DocLLM,
-		"vgi.doc_md":   d.DocMD,
-	}
-}
-
-// resultColumn describes one output column for vgi.result_columns_schema.
-type resultColumn struct {
-	Name        string `json:"name"`
-	Type        string `json:"type"`
-	Description string `json:"description"`
-}
-
-// column builds an Arrow field whose comment shows up in DuckDB's DESCRIBE and agent tools.
-func column(name string, typ arrow.DataType, comment string, nullable bool) arrow.Field {
-	return arrow.Field{Name: name, Type: typ, Nullable: nullable,
-		Metadata: arrow.NewMetadata([]string{"comment"}, []string{comment})}
-}
-
-// exampleQuery is one entry of vgi.example_queries.
-type exampleQuery struct {
-	Description string `json:"description"`
-	SQL         string `json:"sql"`
-}
-
-// exampleQueries converts catalog examples to vgi.example_queries entries.
-func exampleQueries(lists ...[]vgi.CatalogExample) []exampleQuery {
-	out := []exampleQuery{}
-	for _, examples := range lists {
-		for _, ex := range examples {
-			out = append(out, exampleQuery{Description: ex.Description, SQL: ex.SQL})
-		}
-	}
-	return out
-}
-
-// withExamples publishes examples (with descriptions) as vgi.example_queries.
-// Overloads share one SQL name, so pass every overload's examples.
-func withExamples(tags map[string]string, lists ...[]vgi.CatalogExample) map[string]string {
-	tags["vgi.example_queries"] = mustJSON(exampleQueries(lists...))
-	return tags
-}
-
-const catalogDocLLM = "An example VGI worker generated from the Query.Farm starter template. It " +
-	"shows the three shapes most workers need: a vectorized scalar function with an overload, a " +
-	"deterministic table function with a named default argument, and a table function that pages " +
-	"through a REST API with retries and an optional bearer token taken from a DuckDB secret or an " +
-	"environment variable. Replace them with your own functions; keep the metadata complete so " +
-	"agents can discover and call them."
-
-// CatalogDocMD is the catalog's long human-facing description (also its comment).
-const CatalogDocMD = "# VGI terraform worker\n\n" +
-	"**An example [VGI](https://query.farm/vgi) worker that brings custom functions into DuckDB " +
-	"SQL.** It was generated from the Query.Farm starter template and is meant to be renamed and " +
-	"rewritten: every function here demonstrates one pattern you will reuse, from vectorized scalars " +
-	"and streaming table functions to a REST API reader that retries politely and reads a bearer " +
-	"token from a DuckDB secret or the environment.\n\n" +
-	"The worker speaks Apache Arrow to DuckDB over stdin/stdout, a Unix socket, or HTTP, so the " +
-	"same code runs as a local subprocess or a hosted service. See the " +
-	"[VGI documentation](https://query.farm/vgi/docs/) to learn more."
-
-const schemaDocLLM = "The `main` schema holds the starter template's example functions, one per common worker " +
-	"pattern. `greet(name)` and `greet(name, style)` are vectorized scalars: use them inside a " +
-	"projection or predicate, one result per row; `style` is a constant that must be 'casual' or " +
-	"'formal'. `sequence_table(count, step := 1)` is a deterministic table function that returns " +
-	"`count` rows of `(n, squared)`; use it for demos, tests, and as a template for generators. " +
-	"`fetch_items(base_url, page_size := 100)` reads every item from a paginated JSON REST API as " +
-	"`(id, name, category, price)` rows, streaming one page per batch, retrying rate-limited " +
-	"requests, and authenticating with a `terraform_api` DuckDB secret or the `TERRAFORM_API_TOKEN` " +
-	"environment variable. Scalars cannot take named arguments; table functions can."
-
-// SchemaDocMD is the main schema's human-facing description (also its comment).
-const SchemaDocMD = "## main\n\n" +
-	"The starter template's example functions, one per common worker pattern.\n\n" +
-	"- **Scalars** answer one question per row and slot into a projection or predicate.\n" +
-	"- **Table functions** return sets of rows, streamed to DuckDB in Arrow batches.\n" +
-	"- **REST readers** page through an HTTP API and authenticate with a DuckDB secret."
+// CatalogDocMD is the catalog's long human-facing description.
+const CatalogDocMD = "# HCP Terraform\n\n" +
+	"Query [HCP Terraform](https://developer.hashicorp.com/terraform/cloud-docs) and Terraform Enterprise from " +
+	"DuckDB: workspaces, runs, plans and applies, policy results, cost estimates, state versions, outputs, " +
+	"resources, variables, teams, agents, the private registry and drift-detection results. Read-only: the " +
+	"worker only sends GET requests, and sensitive variables and outputs are never returned.\n\n" +
+	"Connect with a `terraform` secret (add `HOSTNAME` for Terraform Enterprise):\n\n" +
+	"```sql\nCREATE SECRET (TYPE terraform, TOKEN '...', ORGANIZATION 'acme');\n```\n\n" +
+	"Schema `files` reads `terraform.tfstate` files and `terraform show -json` plans offline, with no " +
+	"credentials, for OpenTofu and Terraform alike. Schema `unified` holds runs in the shape shared by the " +
+	"Query.Farm orchestrator workers."
 
 // agentTask is one public analyst task for `vgi-lint simulate`.
 type agentTask struct {
@@ -167,40 +40,131 @@ type agentTask struct {
 
 // agentTestTasks are graded privately by vgi-agent-tests.yaml.
 var agentTestTasks = []agentTask{
-	{Name: "formal_greeting", Prompt: "Using the terraform worker, greet the name 'Grace' formally."},
-	{Name: "sum_of_squares", Prompt: "Using the terraform worker, what is the sum of the squared column for the first 10 rows " +
-		"of the sequence with the default step?"},
-	{Name: "stepped_sequence", Prompt: "List the n values of a 4-row sequence that steps by 5, in ascending order."},
-	{Name: "items_per_category", Prompt: "The items API is running at https://vgi-starter-api.query-farm.services/v1. How many items does it have in each category?"},
+	{Name: "forced_replacements", Prompt: "Using the Terraform worker's bundled sample plan sample:change.plan.json, which resources will be replaced, and which attribute forces each replacement?"},
+	{Name: "plan_action_counts", Prompt: "In the bundled sample plan sample:change.plan.json, how many resource instances are planned for each action?"},
+	{Name: "destroyed_resources", Prompt: "Which resource addresses does the bundled sample plan sample:change.plan.json delete without recreating them?"},
+	{Name: "state_types", Prompt: "How many resource instances of each resource type are in the bundled sample state sample:basic.tfstate?"},
+	{Name: "sensitive_outputs", Prompt: "Which outputs of the bundled sample state sample:basic.tfstate are sensitive?"},
+	{Name: "state_dependencies", Prompt: "In the bundled sample state sample:basic.tfstate, which resource instances depend on random_pet.server?"},
+	{Name: "port_values", Prompt: "What are the result values of the random_integer.port instances in the bundled sample state sample:basic.tfstate, ordered by instance index?"},
+	{Name: "unknown_outputs", Prompt: "Which outputs of the bundled sample plan sample:change.plan.json will only be known after apply?"},
+	{Name: "errored_runs", Prompt: "Using the HCP Terraform worker, which runs in the organization errored, and in which workspace did each run?"},
+	{Name: "plan_destructions", Prompt: "Across all runs, which workspace's plans would destroy the most resources in total, and how many?"},
+	{Name: "failed_applies", Prompt: "Which runs had an apply that errored?"},
+	{Name: "cost_increases", Prompt: "Which runs raise the estimated monthly cost, and by how much?"},
+	{Name: "soft_failed_policy", Prompt: "For run run-net-2, how many Sentinel policies passed and how many soft-failed?"},
+	{Name: "opa_mandatory", Prompt: "For run run-app-2, which task stage has an OPA policy evaluation with mandatory failures, and how many?"},
+	{Name: "state_history", Prompt: "How many state versions does the prod-network workspace have, and what is the highest serial?"},
+	{Name: "vpc_output", Prompt: "What is the value of the vpc_id output in the current state of the prod-network workspace?"},
+	{Name: "resource_types", Prompt: "How many resources of each resource type are in the current state of the prod-network workspace?"},
+	{Name: "sensitive_variables", Prompt: "Which variables of the prod-network workspace are sensitive?"},
+	{Name: "global_varset_keys", Prompt: "Which variable keys does the organization's global variable set define?"},
+	{Name: "workspace_admins", Prompt: "Which teams have admin access to the prod-network workspace?"},
+	{Name: "unhealthy_agents", Prompt: "Which self-hosted agents, in which agent pool, are neither idle nor busy?"},
+	{Name: "module_versions", Prompt: "How many published versions does each private registry module have?"},
+	{Name: "private_providers", Prompt: "Which providers are published in the organization's private registry?"},
+	{Name: "drifted_workspaces", Prompt: "Which workspaces have drifted according to their latest health assessment?"},
+	{Name: "drift_notifications", Prompt: "Which notification destinations of the prod-network workspace fire when drift is detected?"},
+	{Name: "project_workspaces", Prompt: "How many workspaces does each project contain, by project name?"},
+	{Name: "assessment_orgs", Prompt: "Which organizations enforce health assessments for every workspace?"},
+	{Name: "unified_outcomes", Prompt: "In the cross-orchestrator unified shape, how many Terraform runs ended in each normalized status?"},
+	{Name: "skipped_phases", Prompt: "In the unified task runs, which Terraform runs had a skipped apply phase?"},
 }
 
 // CatalogTags are the catalog-level discovery tags.
 var CatalogTags = map[string]string{
-	"vgi.title":              "VGI Terraform Worker",
-	"vgi.subtitle":           "Example DuckDB functions to rename and replace: a scalar, a table function and a REST API reader.",
+	"vgi.title":              "HCP Terraform",
+	"vgi.subtitle":           "HCP Terraform / Terraform Enterprise runs, workspaces, policies and state as SQL, plus offline tfstate and plan readers.",
 	"vgi.doc_llm":            catalogDocLLM,
 	"vgi.doc_md":             CatalogDocMD,
 	"vgi.source_url":         SourceURL,
 	"vgi.icon_url":           "https://query.farm/media-kit/products/vgi/vgi-logo.png",
 	"vgi.license":            "0BSD",
 	"vgi.author":             "Query.Farm",
-	"vgi.copyright":          "Copyright 2026 Query.Farm LLC",
-	"vgi.keywords":           keywordsArray("vgi, duckdb, starter template, example worker, rest api, table function"),
+	"vgi.copyright":          "Copyright 2026 Query Farm LLC - https://query.farm",
+	"vgi.keywords":           keywordsArray("terraform, hcp terraform, terraform cloud, terraform enterprise, opentofu, infrastructure as code, tfstate, terraform plan, drift detection, sentinel, opa"),
 	"vgi.support_contact":    SourceURL + "/issues",
 	"vgi.support_policy_url": SourceURL + "#support",
-	// Public analyst tasks for `vgi-lint simulate`; private graders live in vgi-agent-tests.yaml.
-	"vgi.agent_test_tasks": mustJSON(agentTestTasks),
+	"vgi.agent_test_tasks":   mustJSON(agentTestTasks),
 }
 
-// schemaTags builds the main schema's tags; allExamples feeds vgi.example_queries.
-func schemaTags(allExamples []exampleQuery) map[string]string {
+// schemaInfo is the per-schema discovery text.
+type schemaInfo struct {
+	Title, Domain, Keywords, DocLLM, DocMD string
+	Categories                             []string
+}
+
+var mainSchema = schemaInfo{
+	Title: "HCP Terraform API", Domain: "infrastructure as code",
+	Keywords: "hcp terraform, terraform enterprise, workspaces, runs, plans, policy checks, state versions, variables, teams, agents, registry, drift",
+	DocLLM: "Schema main reads the HCP Terraform / Terraform Enterprise API v2 with the terraform secret's TOKEN. " +
+		"Organization-scoped functions take organization := (default the secret's ORGANIZATION): projects, " +
+		"workspaces, runs / plans / applies / cost_estimates (also workspace_id :=), variable_sets, teams, " +
+		"agent_pools, registry_modules, registry_providers, assessments. Workspace-scoped functions take a " +
+		"positional workspace_id (ws-...): variables, workspace_resources, team_access, notification_configurations; " +
+		"state_versions takes the workspace name. Run-scoped: policy_checks(run_id), policy_evaluations(run_id). " +
+		"Start from workspaces() or runs(); their WHERE filters on status, project, name and creation time push " +
+		"down to the API. Sensitive variable and output values are always NULL; webhook URLs are reduced to their host.",
+	DocMD: "## main\n\nThe HCP Terraform / Terraform Enterprise API v2, read with the `terraform` secret's token.\n\n" +
+		"Objects follow the API hierarchy: organization, project, workspace, run, then the run's plan and apply. " +
+		"Functions below the organization take the parent's id as an argument.\n\n" +
+		"WHERE filters on run status, source, workspace and creation time, and on workspace project, name and " +
+		"current-run status, are sent to the API. Sensitive variable and output values are never returned.",
+	Categories: []string{"organization", "workspaces", "runs", "state", "registry"},
+}
+
+var filesSchema = schemaInfo{
+	Title: "State and Plan Files", Domain: "infrastructure as code",
+	Keywords: "terraform.tfstate, state file, plan json, terraform show -json, opentofu, offline",
+	DocLLM: "Schema files reads Terraform / OpenTofu documents from the worker's filesystem with no credentials: " +
+		"terraform.tfstate files (state format version 4: resource instances with their attributes, and root " +
+		"outputs) and the JSON printed by `terraform show -json <planfile>` (resource changes with the action, " +
+		"why it was chosen, which attributes force a replacement and masked before/after values, and output " +
+		"changes). Every function takes the document path as its one positional argument. Sensitive values are " +
+		"masked. sample:basic.tfstate and sample:change.plan.json are bundled samples that work everywhere.",
+	DocMD: "## files\n\nOffline readers for `terraform.tfstate` files and `terraform show -json` plans, from " +
+		"Terraform or OpenTofu. No credentials and no network.\n\n" +
+		"Sensitive values are masked. Try them on the bundled `sample:basic.tfstate` and `sample:change.plan.json`.",
+	Categories: []string{"files"},
+}
+
+var unifiedSchema = schemaInfo{
+	Title: "Unified Orchestrator Runs", Domain: "workflow orchestration",
+	Keywords: "unified, runs, task runs, orchestrator, cross-tool, union all, terraform",
+	DocLLM: "Schema unified has two tables with the exact columns the airflow, dagster, prefect, temporal, dbt, " +
+		"databricks and github workers also expose, for UNION ALL across tools. runs: one row per HCP Terraform " +
+		"run of the secret's ORGANIZATION (pipeline = workspace name). task_runs: the plan and apply phase of each run.",
+	DocMD: "## unified\n\n`runs` and `task_runs` in the column layout shared by every Query.Farm orchestrator " +
+		"worker, for `UNION ALL` across tools.\n\n" +
+		"A Terraform run is a deployment of one workspace's infrastructure; its plan and apply are its task runs. " +
+		"Statuses are normalized to queued, running, success, failed, cancelled and skipped.",
+	Categories: []string{"unified"},
+}
+
+// Schema comments.
+const (
+	MainSchemaComment    = "HCP Terraform / Terraform Enterprise API: workspaces, runs, policies, state, variables, teams, agents and registry."
+	FilesSchemaComment   = "Offline readers for terraform.tfstate files and terraform show -json plans."
+	UnifiedSchemaComment = "runs and task_runs in the shape shared by every orchestrator worker."
+)
+
+// schemaTags builds a schema's tags.
+func schemaTags(si schemaInfo, examples []exampleQuery) map[string]string {
+	var cats []category
+	for _, name := range si.Categories {
+		for _, c := range SchemaCategories {
+			if c.Name == name {
+				cats = append(cats, c)
+			}
+		}
+	}
 	return map[string]string{
-		"vgi.title":           "Terraform Functions",
-		"domain":              "examples",
-		"vgi.keywords":        keywordsArray("greeting, sequence, generator, rest api, pagination"),
-		"vgi.doc_llm":         schemaDocLLM,
-		"vgi.doc_md":          SchemaDocMD,
-		"vgi.categories":      mustJSON(SchemaCategories),
-		"vgi.example_queries": mustJSON(allExamples),
+		"vgi.title":           si.Title,
+		"domain":              si.Domain,
+		"vgi.keywords":        keywordsArray(si.Keywords),
+		"vgi.doc_llm":         si.DocLLM,
+		"vgi.doc_md":          si.DocMD,
+		"vgi.categories":      mustJSON(cats),
+		"vgi.example_queries": mustJSON(examples),
 	}
 }

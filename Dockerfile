@@ -3,10 +3,10 @@
 #   docker run -p 8000:8000 IMAGE         -> HTTP on $PORT (default 8000; GET /health)
 #   docker run -i IMAGE stdio             -> stdio worker, for DuckDB on the same host
 
-# A pure-Go, statically linked build (no cgo): the worker doesn't link vgi-go's
-# optional DuckDB expression evaluator (vgi/exprduckdb).
+# A cgo build: the worker links vgi-go's DuckDB expression evaluator
+# (vgi/exprduckdb) as the exact-filter fallback.
 FROM golang:1.26-bookworm AS build
-ENV CGO_ENABLED=0
+ENV CGO_ENABLED=1
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
@@ -20,7 +20,7 @@ FROM debian:bookworm-slim
 ARG VERSION=0.0.0
 ARG GIT_COMMIT=unknown
 LABEL org.opencontainers.image.title="vgi-terraform-worker" \
-      org.opencontainers.image.description="A VGI worker for DuckDB" \
+      org.opencontainers.image.description="HCP Terraform runs, workspaces, state and plan files as SQL in DuckDB (VGI worker)" \
       org.opencontainers.image.source="https://github.com/Query-farm/vgi-terraform" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${GIT_COMMIT}" \

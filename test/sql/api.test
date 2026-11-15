@@ -1,0 +1,467 @@
+# name: test/sql/api.test
+# description: HCP Terraform API tables against the strict replay server (test/mock_api/server.py).
+# group: [terraform]
+
+require vgi
+
+require-env TERRAFORM_WORKER
+
+require-env TERRAFORM_MOCK_API
+
+statement ok
+LOAD httpfs;
+
+statement ok
+LOAD json;
+
+statement ok
+ATTACH 'terraform' (TYPE vgi, LOCATION '{TERRAFORM_WORKER}');
+
+# Without a secret every API table explains how to create one.
+statement error
+SELECT * FROM terraform.main.organizations;
+----
+<REGEX>:.*no terraform secret.*
+
+# A wrong token is a 401 from the API.
+statement ok
+CREATE SECRET bad (TYPE terraform, TOKEN 'wrong-token', ORGANIZATION 'acme', BASE_URL '{TERRAFORM_MOCK_API}');
+
+statement error
+SELECT * FROM terraform.main.organizations;
+----
+<REGEX>:.*HTTP 401.*
+
+statement ok
+DROP SECRET bad;
+
+statement ok
+CREATE SECRET tf (TYPE terraform, TOKEN 'test-token', ORGANIZATION 'acme', BASE_URL '{TERRAFORM_MOCK_API}');
+
+# ---------------------------------------------------------------- organization
+
+query TTT
+SELECT name, plan_identifier, assessments_enforced FROM terraform.main.organizations ORDER BY name;
+----
+acme	standard	false
+globex	free	true
+
+query TTII
+SELECT id, name, workspace_count, team_count FROM terraform.main.projects() ORDER BY id;
+----
+prj-apps	Applications	2	1
+prj-core	Core Infra	2	2
+
+# organization := overrides the secret's default.
+query I
+SELECT count(*) FROM terraform.main.projects(organization := 'globex');
+----
+0
+
+query TITT
+SELECT name, users_count, visibility, organization_access->>'manage-workspaces' FROM terraform.main.teams() ORDER BY name;
+----
+network-eng	5	organization	false
+owners	2	secret	true
+
+query TTTT
+SELECT t.name, a.access, a.state_versions, a.workspace_locking FROM terraform.main.team_access('ws-net') a
+JOIN terraform.main.teams() t ON t.id = a.team_id ORDER BY t.name;
+----
+network-eng	write	read	true
+owners	admin	write	true
+
+query TTI
+SELECT name, organization_scoped, agent_count FROM terraform.main.agent_pools();
+----
+datacenter-1	false	3
+
+query TTT
+SELECT name, status, ip_address FROM terraform.main.agents('apool-dc1') WHERE status NOT IN ('idle', 'busy');
+----
+dc1-c	errored	10.1.0.12
+
+query TTT
+SELECT name, provider, versions FROM terraform.main.registry_modules() ORDER BY name;
+----
+eks	aws	[0.3.0]
+vpc	aws	[2.1.0, 2.0.0]
+
+query TT
+SELECT namespace, name FROM terraform.main.registry_providers();
+----
+acme	internal
+
+# ---------------------------------------------------------------- workspaces
+
+query TTITTT
+SELECT name, project_id, resource_count, current_run_status, locked, tag_names FROM terraform.main.workspaces() ORDER BY name;
+----
+prod-app	prj-apps	17	planning	false	[prod, app]
+prod-network	prj-core	42	applied	false	[prod, network]
+sandbox	prj-core	0	NULL	true	[]
+staging-app	prj-apps	9	planned_and_finished	false	[staging, app]
+
+# Pushed down: filter[project][id], search[name], filter[current-run][status]; tags := is search[tags].
+query T
+SELECT name FROM terraform.main.workspaces() WHERE project_id = 'prj-core' ORDER BY name;
+----
+prod-network
+sandbox
+
+query T
+SELECT name FROM terraform.main.workspaces() WHERE name = 'prod-app';
+----
+prod-app
+
+query T
+SELECT name FROM terraform.main.workspaces() WHERE current_run_status = 'applied';
+----
+prod-network
+
+query T
+SELECT name FROM terraform.main.workspaces(tags := 'app,prod');
+----
+prod-app
+
+# search[name] is fuzzy upstream; the exact predicate is still applied.
+query T
+SELECT name FROM terraform.main.workspaces() WHERE name = 'prod';
+----
+
+# LIKE is not translated, but is evaluated exactly in the worker.
+query T
+SELECT name FROM terraform.main.workspaces() WHERE name LIKE '%-app' ORDER BY name;
+----
+prod-app
+staging-app
+
+query R
+SELECT plan_duration_average_seconds FROM terraform.main.workspaces() WHERE name = 'prod-network';
+----
+95.0
+
+query T
+SELECT url FROM terraform.main.workspaces() WHERE name = 'sandbox';
+----
+<REGEX>:http://127\.0\.0\.1:\d+/app/acme/workspaces/sandbox
+
+query I
+SELECT count(*) FROM read_json('{TERRAFORM_MOCK_API}/__log')
+WHERE url LIKE '/organizations/acme/workspaces?%filter[project][id]=prj-core%';
+----
+<REGEX>:[1-9]\d*
+
+query I
+SELECT count(*) FROM read_json('{TERRAFORM_MOCK_API}/__log')
+WHERE url LIKE '/organizations/acme/workspaces?%filter[current-run][status]=applied%';
+----
+<REGEX>:[1-9]\d*
+
+query I
+SELECT count(*) FROM read_json('{TERRAFORM_MOCK_API}/__log')
+WHERE url LIKE '/organizations/acme/workspaces?%search[name]=prod-app%';
+----
+<REGEX>:[1-9]\d*
+
+query I
+SELECT count(*) FROM read_json('{TERRAFORM_MOCK_API}/__log')
+WHERE url LIKE '/organizations/acme/workspaces?%search[tags]=app,prod%';
+----
+<REGEX>:[1-9]\d*
+
+# ---------------------------------------------------------------- runs
+
+query TTTIIII
+SELECT id, workspace_name, status, resource_additions, resource_changes, resource_destructions, resource_imports
+FROM terraform.main.runs() ORDER BY created_at DESC;
+----
+run-app-3	prod-app	planning	0	0	0	0
+run-app-2	prod-app	errored	2	1	0	0
+run-net-2	prod-network	applied	3	2	1	0
+run-stg-1	staging-app	planned_and_finished	0	0	0	0
+run-app-1	prod-app	applied	5	0	4	1
+run-net-1	prod-network	discarded	0	0	12	0
+
+query T
+SELECT id FROM terraform.main.runs(workspace_id := 'ws-net') ORDER BY id;
+----
+run-net-1
+run-net-2
+
+# status IN, source and workspace_name push down.
+query TT
+SELECT id, status FROM terraform.main.runs() WHERE status IN ('applied', 'errored') ORDER BY id;
+----
+run-app-1	applied
+run-app-2	errored
+run-net-2	applied
+
+query T
+SELECT id FROM terraform.main.runs() WHERE source = 'tfe-ui' ORDER BY id;
+----
+run-net-1
+run-net-2
+
+query T
+SELECT id FROM terraform.main.runs() WHERE workspace_name = 'staging-app';
+----
+run-stg-1
+
+query I
+SELECT count(*) FROM read_json('{TERRAFORM_MOCK_API}/__log')
+WHERE url LIKE '/organizations/acme/runs?%filter[source]=tfe-ui%';
+----
+<REGEX>:[1-9]\d*
+
+query I
+SELECT count(*) FROM read_json('{TERRAFORM_MOCK_API}/__log')
+WHERE url LIKE '/organizations/acme/runs?%filter[workspace_names]=staging-app%';
+----
+<REGEX>:[1-9]\d*
+
+# A created_at lower bound stops paging once older runs appear (runs are newest first, 2 per page here).
+query T
+SELECT id FROM terraform.main.runs() WHERE created_at >= TIMESTAMPTZ '2026-11-13 00:00:00+00'
+AND status IN ('applied', 'errored', 'discarded', 'planned_and_finished') ORDER BY id;
+----
+run-app-2
+run-net-2
+
+query I
+SELECT count(*) FROM read_json('{TERRAFORM_MOCK_API}/__log')
+WHERE url LIKE '/organizations/acme/runs?%discarded%page[number]=2&%';
+----
+<REGEX>:[1-9]\d*
+
+query I
+SELECT count(*) FROM read_json('{TERRAFORM_MOCK_API}/__log')
+WHERE url LIKE '/organizations/acme/runs?%discarded%page[number]=3&%';
+----
+0
+
+query T
+SELECT url FROM terraform.main.runs() WHERE id = 'run-net-2';
+----
+<REGEX>:http://127\.0\.0\.1:\d+/app/acme/workspaces/prod-network/runs/run-net-2
+
+query TTTT
+SELECT source, trigger_reason, is_destroy, has_changes FROM terraform.main.runs() WHERE status = 'planned_and_finished';
+----
+tfe-api	manual	false	false
+
+query T
+SELECT status_timestamps->>'applied-at' FROM terraform.main.runs() WHERE id = 'run-net-2';
+----
+2026-11-13T09:20:00.000Z
+
+# ---------------------------------------------------------------- plans / applies / cost estimates
+
+query TTTIT
+SELECT run_id, id, status, resource_destructions, finished_at FROM terraform.main.plans() ORDER BY run_created_at DESC;
+----
+run-app-3	plan-app-3	running	0	NULL
+run-app-2	plan-app-2	finished	0	2026-11-14 10:01:05+00
+run-net-2	plan-net-2	finished	1	2026-11-13 09:01:40+00
+run-stg-1	plan-stg-1	finished	0	2026-11-12 08:00:50+00
+run-app-1	plan-app-1	finished	4	2026-11-10 12:04:03+00
+run-net-1	plan-net-1	finished	12	2026-11-05 15:02:00+00
+
+query TTI
+SELECT run_id, status, resource_additions FROM terraform.main.applies() WHERE status <> 'unreachable' ORDER BY run_id;
+----
+run-app-1	finished	5
+run-app-2	errored	1
+run-net-2	finished	3
+
+query TRRR
+SELECT run_id, prior_monthly_cost, proposed_monthly_cost, delta_monthly_cost FROM terraform.main.cost_estimates() ORDER BY run_id;
+----
+run-app-1	1300.0	1200.5	-99.5
+run-app-2	1200.5	1350.75	150.25
+run-net-2	800.0	1012.4	212.4
+
+# ---------------------------------------------------------------- policy
+
+query TTTIII
+SELECT id, status, result, passed, soft_failed, duration_ms FROM terraform.main.policy_checks('run-net-2');
+----
+polchk-net-2	soft_failed	false	4	1	412
+
+query I
+SELECT count(*) FROM terraform.main.policy_checks('run-app-1');
+----
+0
+
+query TTTII
+SELECT stage, policy_kind, status, mandatory_failed, passed FROM terraform.main.policy_evaluations('run-app-2') ORDER BY stage;
+----
+post_plan	opa	failed	2	5
+pre_apply	sentinel	passed	0	3
+
+# ---------------------------------------------------------------- state
+
+query TIIT
+SELECT id, serial, size, run_id FROM terraform.main.state_versions('prod-network') ORDER BY serial;
+----
+sv-net-1	13	47002	NULL
+sv-net-2	14	48213	run-net-2
+
+query TTTT
+SELECT name, sensitive, value, detailed_type FROM terraform.main.state_version_outputs(state_version_id := 'sv-net-2') ORDER BY name;
+----
+subnet_ids	false	["subnet-1","subnet-2"]	["list","string"]
+vpc_id	false	"vpc-0a1b2c"	"string"
+vpn_psk	true	NULL	"string"
+
+query TT
+SELECT name, workspace_id FROM terraform.main.state_version_outputs(workspace_id := 'ws-net') WHERE sensitive;
+----
+vpn_psk	ws-net
+
+statement error
+SELECT * FROM terraform.main.state_version_outputs();
+----
+<REGEX>:.*exactly one of state_version_id.*
+
+query TI
+SELECT provider_type, count(*) FROM terraform.main.workspace_resources('ws-net') GROUP BY provider_type ORDER BY provider_type;
+----
+aws_ec2_transit_gateway	1
+aws_subnet	2
+aws_vpc	1
+
+query TT
+SELECT address, module FROM terraform.main.workspace_resources('ws-net') WHERE module <> 'root';
+----
+module.tgw.aws_ec2_transit_gateway.this	module.tgw
+
+# ---------------------------------------------------------------- variables (sensitive values never returned)
+
+query TTTTT
+SELECT key, value, sensitive, category, hcl FROM terraform.main.variables('ws-net') ORDER BY key;
+----
+AWS_SECRET_ACCESS_KEY	NULL	true	env	false
+cidrs	["10.0.0.0/16"]	false	terraform	true
+region	us-east-1	false	terraform	false
+
+query TTIT
+SELECT name, global, var_count, priority FROM terraform.main.variable_sets() ORDER BY name;
+----
+aws-credentials	true	2	false
+default-tags	false	1	true
+
+query TTT
+SELECT key, value, sensitive FROM terraform.main.varset_variables('varset-aws') ORDER BY key;
+----
+AWS_ACCESS_KEY_ID	AKIAEXAMPLE	false
+AWS_SECRET_ACCESS_KEY	NULL	true
+
+# ---------------------------------------------------------------- notifications and drift
+
+query TTTTT
+SELECT name, destination_type, enabled, destination_host, triggers FROM terraform.main.notification_configurations('ws-net') ORDER BY name;
+----
+net-alerts	slack	true	hooks.slack.com	['run:errored', 'assessment:drifted']
+owners-email	email	false	NULL	['run:completed']
+
+query TTTTTT
+SELECT workspace_name, assessments_enabled, assessment_result_id, drifted, succeeded, error_message FROM terraform.main.assessments() ORDER BY workspace_name;
+----
+prod-app	true	asmtres-app	false	false	provider authentication failed
+prod-network	true	asmtres-net	true	true	NULL
+sandbox	true	NULL	NULL	NULL	NULL
+
+# ---------------------------------------------------------------- unified shape
+
+query TTTTTTR
+SELECT orchestrator, run_id, pipeline, status, raw_status, trigger, duration_seconds FROM terraform.unified.runs ORDER BY queued_at;
+----
+terraform	run-net-1	prod-network	cancelled	discarded	manual	3599.0
+terraform	run-app-1	prod-app	success	applied	event	1799.0
+terraform	run-stg-1	staging-app	success	planned_and_finished	api	49.0
+terraform	run-net-2	prod-network	success	applied	manual	1199.0
+terraform	run-app-2	prod-app	failed	errored	event	238.0
+terraform	run-app-3	prod-app	running	planning	api	NULL
+
+query T
+SELECT run_id FROM terraform.unified.runs WHERE status = 'success' AND pipeline = 'prod-app';
+----
+run-app-1
+
+query I
+SELECT count(*) FROM read_json('{TERRAFORM_MOCK_API}/__log')
+WHERE url LIKE '/organizations/acme/runs?%filter[status]=applied,planned_and_finished,planned_and_saved%filter[workspace_names]=prod-app%';
+----
+<REGEX>:[1-9]\d*
+
+# running is an open set of statuses, so it is evaluated in the worker.
+query T
+SELECT run_id FROM terraform.unified.runs WHERE status = 'running';
+----
+run-app-3
+
+query T
+SELECT run_id FROM terraform.unified.runs WHERE raw_status = 'discarded';
+----
+run-net-1
+
+query TTTTTIR
+SELECT run_id, task_run_id, task_name, status, raw_status, attempt, duration_seconds FROM terraform.unified.task_runs ORDER BY run_id, task_name DESC;
+----
+run-app-1	plan-app-1	plan	success	finished	1	240.0
+run-app-1	apply-app-1	apply	success	finished	1	1500.0
+run-app-2	plan-app-2	plan	success	finished	1	60.0
+run-app-2	apply-app-2	apply	failed	errored	1	120.0
+run-app-3	plan-app-3	plan	running	running	1	NULL
+run-app-3	apply-app-3	apply	skipped	unreachable	1	NULL
+run-net-1	plan-net-1	plan	success	finished	1	116.0
+run-net-1	apply-net-1	apply	skipped	unreachable	1	NULL
+run-net-2	plan-net-2	plan	success	finished	1	97.0
+run-net-2	apply-net-2	apply	success	finished	1	595.0
+run-stg-1	plan-stg-1	plan	success	finished	1	48.0
+run-stg-1	apply-stg-1	apply	skipped	unreachable	1	NULL
+
+# A run_id filter reads just that run.
+query TT
+SELECT task_name, status FROM terraform.unified.task_runs WHERE run_id = 'run-app-2' ORDER BY task_name;
+----
+apply	failed
+plan	success
+
+query I
+SELECT count(*) FROM read_json('{TERRAFORM_MOCK_API}/__log') WHERE url LIKE '/runs/run-app-2?include=%';
+----
+<REGEX>:[1-9]\d*
+
+# Joining unified.runs to its task runs.
+query TI
+SELECT r.pipeline, count(*) FROM terraform.unified.runs r JOIN terraform.unified.task_runs t ON t.run_id = r.run_id
+WHERE t.status = 'skipped' GROUP BY r.pipeline ORDER BY r.pipeline;
+----
+prod-app	1
+prod-network	1
+staging-app	1
+
+# ---------------------------------------------------------------- upstream errors
+
+statement error
+SELECT * FROM terraform.main.variables('ws-missing');
+----
+<REGEX>:.*HTTP 404.*
+
+statement error
+SELECT * FROM terraform.main.projects(organization := 'nope');
+----
+<REGEX>:.*HTTP 404.*
+
+statement error
+SELECT * FROM terraform.main.variables('');
+----
+<REGEX>:.*workspace_id must not be empty.*
+
+# Every request carried the bearer token and was accepted (no 400 from unknown parameters).
+query I
+SELECT count(*) FROM read_json('{TERRAFORM_MOCK_API}/__log') WHERE url LIKE '%filter[unknown%';
+----
+0

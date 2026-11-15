@@ -7,7 +7,7 @@
 location = "bin/vgi-terraform-worker"
 
 # Fail on warnings while you build. Raise this to "info" before you publish the worker.
-fail_on = "warning"
+fail_on = "info"
 
 # Waive a finding only with a kind and a reason, so the waiver can be audited:
 #   domain-exemption  permanent and legitimate for this worker
@@ -16,6 +16,20 @@ fail_on = "warning"
 #   tooling-bug       the linter is wrong; report it upstream
 ignore = [
   # { code = "VGI146", kind = "domain-exemption", reason = "every entry point needs a key" },
+  { code = "VGI808", kind = "tooling-bug", reason = "the only hits are each unified table's own primary key (runs.run_id, task_runs.task_run_id): the rule compares the singular column base ('run') with the plural table name ('runs') and suggests a self-referencing FK; the real reference task_runs.run_id -> runs.run_id is declared" },
+]
+
+# 'sample:change.plan.json' is not a repo file: it is embedded in the worker binary
+# (internal/terraform/samples, go:embed) and served by the sample: scheme, so the
+# examples run anywhere the worker runs. VGI516 matches the .json suffix.
+[per_object."terraform.files.read_plan"]
+ignore = [
+  { code = "VGI516", kind = "tooling-bug", reason = "sample:<name> reads a document embedded in the worker binary (go:embed), not a local file; the example runs for every user" },
+]
+
+[per_object."terraform.files.plan_outputs"]
+ignore = [
+  { code = "VGI516", kind = "tooling-bug", reason = "sample:<name> reads a document embedded in the worker binary (go:embed), not a local file; the example runs for every user" },
 ]
 
 # Adopting the gate on a worker that already has findings? Record them once with

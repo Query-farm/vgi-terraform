@@ -12,9 +12,12 @@ require (
 )
 
 require (
+	github.com/Query-farm-haybarn/haybarn-go-bindings v0.20000.0-rc.9 // indirect
+	github.com/Query-farm-haybarn/haybarn-go/v2 v2.20000.0-rc.9 // indirect
 	github.com/andybalholm/brotli v1.2.2 // indirect
 	github.com/apache/thrift v0.24.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
 	github.com/goccy/go-json v0.10.6 // indirect
 	github.com/google/flatbuffers v25.12.19+incompatible // indirect
 	github.com/google/uuid v1.6.0 // indirect
@@ -32,6 +35,10 @@ require (
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
+	haybarn-extensions.query.farm/go/libhaybarn/darwin-arm64 v0.20000.0-rc.9 // indirect
+	haybarn-extensions.query.farm/go/libhaybarn/linux-amd64 v0.20000.0-rc.9 // indirect
+	haybarn-extensions.query.farm/go/libhaybarn/linux-arm64 v0.20000.0-rc.9 // indirect
+	haybarn-extensions.query.farm/go/libhaybarn/windows-amd64 v0.20000.0-rc.9 // indirect
 	modernc.org/libc v1.75.3 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.0 // indirect
