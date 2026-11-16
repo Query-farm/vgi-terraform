@@ -97,14 +97,17 @@ type schemaInfo struct {
 var mainSchema = schemaInfo{
 	Title: "HCP Terraform API", Domain: "infrastructure as code",
 	Keywords: "hcp terraform, terraform enterprise, workspaces, runs, plans, policy checks, state versions, variables, teams, agents, registry, drift",
-	DocLLM: "Schema main reads the HCP Terraform / Terraform Enterprise API v2 with the terraform secret's TOKEN. " +
-		"Organization-scoped functions take organization := (default the secret's ORGANIZATION): projects, " +
-		"workspaces, runs / plans / applies / cost_estimates (also workspace_id :=), variable_sets, teams, " +
-		"agent_pools, registry_modules, registry_providers, assessments. Workspace-scoped functions take a " +
-		"positional workspace_id (ws-...): variables, workspace_resources, team_access, notification_configurations; " +
-		"state_versions takes the workspace name. Run-scoped: policy_checks(run_id), policy_evaluations(run_id). " +
-		"Start from workspaces() or runs(); their WHERE filters on status, project, name and creation time push " +
-		"down to the API. Sensitive variable and output values are always NULL; webhook URLs are reduced to their host.",
+	DocLLM: "Schema main is the live HCP Terraform / Terraform Enterprise API v2, for questions about what " +
+		"infrastructure runs are doing: which runs errored or would destroy resources, what policy checks and cost " +
+		"estimates said, what a workspace's current state and outputs hold, who has access, and which workspaces " +
+		"have drifted. Auth: the terraform secret's TOKEN, optional HOSTNAME for Terraform Enterprise, and " +
+		"ORGANIZATION as the default organization. Objects follow the API hierarchy organization -> project -> " +
+		"workspace -> run -> plan / apply: organization-scoped functions accept organization := to override the " +
+		"secret's default, workspace-scoped ones take the workspace positionally (its ws-... id, or its name for state history), and run-scoped ones take a " +
+		"run id. Start from the workspace and run listings and join down by id. WHERE filters on run status, source, " +
+		"workspace and creation time, and on workspace project, name and current-run status, push down to the API; " +
+		"other predicates filter locally after paging. Read-only: only GET requests are sent, sensitive variable and " +
+		"output values are always NULL, and webhook URLs are reduced to their host.",
 	DocMD: "## main\n\nThe HCP Terraform / Terraform Enterprise API v2, read with the `terraform` secret's token.\n\n" +
 		"Objects follow the API hierarchy: organization, project, workspace, run, then the run's plan and apply. " +
 		"Functions below the organization take the parent's id as an argument.\n\n" +
