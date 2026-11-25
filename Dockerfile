@@ -41,5 +41,5 @@ USER worker
 
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
-    CMD curl -fsS "http://127.0.0.1:${PORT:-8000}/health" || exit 1
+    CMD curl -fsSI "http://127.0.0.1:${PORT:-8000}/health" || exit 1
 ENTRYPOINT ["docker-entrypoint.sh"]
